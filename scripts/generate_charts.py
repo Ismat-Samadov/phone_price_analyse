@@ -319,38 +319,47 @@ def chart_discounts(rows):
             src_cover[src][0] += 1
 
     sources_with_disc = [s for s in src_disc if src_disc[s]]
-    sources_with_disc.sort(key=lambda s: statistics.mean(src_disc[s]))
+    # Sort by avg discount depth descending so biggest discounters are on top
+    sources_with_disc.sort(key=lambda s: statistics.mean(src_disc[s]), reverse=True)
 
     avg_disc   = [statistics.mean(src_disc[s]) for s in sources_with_disc]
     cover_pcts = [src_cover[s][0] / src_cover[s][1] * 100
                   for s in sources_with_disc]
     labels = [rl(s) for s in sources_with_disc]
 
-    x     = np.arange(len(sources_with_disc))
-    width = 0.38
+    # Two side-by-side horizontal bar charts — one scale each, fully readable
+    fig, (ax_left, ax_right) = plt.subplots(
+        1, 2, figsize=(14, 5),
+        gridspec_kw={"wspace": 0.45}
+    )
+    fig.suptitle("Promotional Strategy — Discount Depth vs Coverage per Retailer",
+                 fontsize=14, fontweight="bold", y=1.01)
 
-    fig, ax1 = plt.subplots(figsize=(12, 5))
-    ax2 = ax1.twinx()
-    ax2.spines["right"].set_visible(True)
+    # ── Left: average discount depth ──────────────────────────────────────
+    bars_l = ax_left.barh(labels, avg_disc, color="#DC2626", height=0.6, alpha=0.85)
+    ax_left.bar_label(bars_l, fmt="%.1f%%", padding=5, fontsize=10)
+    ax_left.set_xlabel("Average Discount Depth (%)")
+    ax_left.set_title("How deep are discounts?", fontsize=12, fontweight="normal")
+    ax_left.set_xlim(0, max(avg_disc) * 1.25)
+    ax_left.invert_yaxis()
 
-    b1 = ax1.bar(x - width/2, avg_disc, width, color="#DC2626",
-                 alpha=0.85, label="Avg Discount %")
-    b2 = ax2.bar(x + width/2, cover_pcts, width, color="#2563EB",
-                 alpha=0.75, label="Discounted Listings %")
+    # ── Right: coverage — % of listings with a discount ───────────────────
+    bar_colors = ["#2563EB" if c >= 90 else
+                  "#D97706" if c >= 50 else
+                  "#DC2626" for c in cover_pcts]
+    bars_r = ax_right.barh(labels, cover_pcts, color=bar_colors, height=0.6, alpha=0.85)
+    ax_right.bar_label(bars_r, fmt="%.0f%%", padding=5, fontsize=10)
+    ax_right.set_xlabel("Share of Listings on Promotion (%)")
+    ax_right.set_title("How many products are discounted?", fontsize=12, fontweight="normal")
+    ax_right.set_xlim(0, 125)
+    ax_right.xaxis.set_major_formatter(mticker.PercentFormatter())
+    ax_right.invert_yaxis()
 
-    ax1.bar_label(b1, fmt="%.1f%%", padding=3, fontsize=9)
-    ax2.bar_label(b2, fmt="%.0f%%", padding=3, fontsize=9)
+    # Colour-key annotation
+    ax_right.text(108, len(labels) - 0.3, "Blue = 90%+\nAmber = 50–89%\nRed = <50%",
+                  fontsize=8, va="top", color="#555555",
+                  bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#CCCCCC"))
 
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(labels, rotation=20, ha="right")
-    ax1.set_ylabel("Average Discount Depth (%)", color="#DC2626")
-    ax2.set_ylabel("Share of Discounted Listings (%)", color="#2563EB")
-    ax1.set_title("Promotional Strategy — Discount Depth vs Coverage per Retailer")
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left",
-               framealpha=0.9)
     fig.tight_layout()
     save(fig, "06_discount_aggressiveness.png")
 
