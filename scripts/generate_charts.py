@@ -378,23 +378,29 @@ def chart_samsung_prices(rows):
     meds    = [statistics.median(src_ps[s]) for s in sources]
     avgs    = [statistics.mean(src_ps[s])   for s in sources]
     counts  = [len(src_ps[s])               for s in sources]
-    labels  = [f"{rl(s)}\n(n={counts[i]})"  for i, s in enumerate(sources)]
+    labels  = [f"{rl(s)}  (n={counts[i]})" for i, s in enumerate(sources)]
 
-    x     = np.arange(len(sources))
-    width = 0.38
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-    fig, ax = plt.subplots(figsize=(12, 5))
-    b1 = ax.bar(x - width/2, meds, width, color="#2563EB",
-                alpha=0.85, label="Median Price")
-    b2 = ax.bar(x + width/2, avgs, width, color="#7C3AED",
-                alpha=0.75, label="Average Price")
-    ax.bar_label(b1, fmt="%.0f AZN", padding=3, fontsize=9)
-    ax.bar_label(b2, fmt="%.0f AZN", padding=3, fontsize=9)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=15, ha="right")
-    ax.set_ylabel("Price (AZN)")
-    ax.set_title("Samsung Price Variance — Same Brand, Different Prices Across Retailers")
-    ax.legend(framealpha=0.9)
+    # Horizontal bars — median price
+    ax.barh(labels, meds, color="#2563EB", height=0.55, alpha=0.85,
+            label="Median Price")
+
+    # Average as a diamond marker
+    ax.scatter(avgs, labels, marker="D", color="#7C3AED", s=60, zorder=5,
+               label="Average Price")
+
+    # Value labels
+    for i, med in enumerate(meds):
+        ax.text(med + 25, i, f"{med:,.0f} AZN", va="center",
+                fontsize=9.5, color="#111111")
+
+    ax.set_xlabel("Price (AZN)")
+    ax.set_title("Samsung Price Variance — Median Price per Retailer\n"
+                 "(diamond = average; gap reflects different model tier focus)")
+    ax.legend(framealpha=0.9, loc="lower right")
+    ax.set_xlim(0, max(meds) * 1.35)
+    ax.invert_yaxis()
     fig.tight_layout()
     save(fig, "07_samsung_price_by_retailer.png")
 
@@ -409,27 +415,34 @@ def chart_apple_prices(rows):
         if r["brand_norm"] == "Apple" and r["price_f"]:
             src_ps[r["source"]].append(r["price_f"])
 
+    # Sort by median ascending
     sources = sorted(src_ps, key=lambda s: statistics.median(src_ps[s]))
     meds    = [statistics.median(src_ps[s]) for s in sources]
     avgs    = [statistics.mean(src_ps[s])   for s in sources]
     counts  = [len(src_ps[s])               for s in sources]
-    labels  = [f"{rl(s)}\n(n={counts[i]})"  for i, s in enumerate(sources)]
+    labels  = [f"{rl(s)}  (n={counts[i]})" for i, s in enumerate(sources)]
 
-    x     = np.arange(len(sources))
-    width = 0.38
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    b1 = ax.bar(x - width/2, meds, width, color="#DC2626",
-                alpha=0.85, label="Median Price")
-    b2 = ax.bar(x + width/2, avgs, width, color="#EA580C",
-                alpha=0.75, label="Average Price")
-    ax.bar_label(b1, fmt="%.0f AZN", padding=3, fontsize=9)
-    ax.bar_label(b2, fmt="%.0f AZN", padding=3, fontsize=9)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=15, ha="right")
-    ax.set_ylabel("Price (AZN)")
-    ax.set_title("Apple Price Variance — Same Brand, Different Prices Across Retailers")
-    ax.legend(framealpha=0.9)
+    # Horizontal bars — median price
+    bars = ax.barh(labels, meds, color="#DC2626", height=0.55, alpha=0.85,
+                   label="Median Price")
+
+    # Average price as a diamond marker — won't blow up the bar scale
+    ax.scatter(avgs, labels, marker="D", color="#EA580C", s=60, zorder=5,
+               label="Average Price")
+
+    # Value labels on bars
+    for i, (med, avg) in enumerate(zip(meds, avgs)):
+        ax.text(med + 60, i, f"{med:,.0f} AZN", va="center",
+                fontsize=9.5, color="#111111")
+
+    ax.set_xlabel("Price (AZN)")
+    ax.set_title("Apple Price Variance — Median Price per Retailer\n"
+                 "(diamond = average; high averages reflect premium flagship mix)")
+    ax.legend(framealpha=0.9, loc="upper left")
+    ax.set_xlim(0, max(meds) * 1.45)
+    ax.invert_yaxis()
     fig.tight_layout()
     save(fig, "08_apple_price_by_retailer.png")
 
