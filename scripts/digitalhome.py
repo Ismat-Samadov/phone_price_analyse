@@ -1,11 +1,32 @@
 """
 Async scraper for digitalhome.az smartphone listings.
 Output: data/digitalhome.csv
+
+Response envelope:
+  {
+    "error": false,
+    "data": "<html fragment>",   # product cards
+    "message": "164 məhsul",     # total count string
+    "additional": {...}
+  }
+
+Card selectors:
+  container  : div.tpproduct
+  name       : h3.tpproduct__title a  (title attr or text)
+  url        : h3.tpproduct__title a[href]
+  image      : div.tpproduct__thumb a img:first-of-type [src]
+  price_new  : span.price-new
+  price_old  : span.price-old
+  in_stock   : div.stock-status-badge span
+  product_id : a.add-to-cart [data-id]
+  discount   : span.product__badge-item
+  install_6m : div.installment-option[data-month="6"] [data-amount]
+  install_12m: div.installment-option[data-month="12"] [data-amount]
 """
 
 import asyncio
 import csv
-import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -21,10 +42,10 @@ BASE_URL = "https://digitalhome.az"
 LISTING_PATH = "/product-categories/smartfonlar"
 
 CATEGORIES = [4, 3, 7, 8, 9, 10, 146, 163, 11, 144]
-PER_PAGE = 24          # bump from 12 to reduce round-trips
+PER_PAGE = 12
 SORT_BY = "default_sorting"
 LAYOUT = "grid"
-CONCURRENCY = 5        # max simultaneous page requests
+CONCURRENCY = 5
 
 OUTPUT_CSV = Path(__file__).parent.parent / "data" / "digitalhome.csv"
 
@@ -44,11 +65,25 @@ HEADERS = {
     "sec-fetch-site": "same-origin",
 }
 
+FIELDNAMES = [
+    "product_id",
+    "name",
+    "price_current",
+    "price_original",
+    "discount",
+    "currency",
+    "in_stock",
+    "installment_6m",
+    "installment_12m",
+    "url",
+    "image",
+]
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def build_params(page: int) -> dict:
+def build_params(page: int) -> list[tuple]:
     params = [
         ("page", page),
         ("per-page", PER_PAGE),
@@ -60,248 +95,129 @@ def build_params(page: int) -> dict:
     return params
 
 
-def extract_csrf(html: str) -> str | None:
-    """Pull _token / csrf-token from the page HTML."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # <meta name="csrf-token" content="...">
-    tag = soup.find("meta", {"name": "csrf-token"})
-    if tag and tag.get("content"):
-        return tag["content"]
-
-    # <input name="_token" value="...">
-    tag = soup.find("input", {"name": "_token"})
-    if tag and tag.get("value"):
-        return tag["value"]
-
-    # inline JS: window.csrf_token = "..."
-    match = re.search(r'csrf[_-]token["\s]*[:=]["\s]*([A-Za-z0-9+/=]{20,})', html)
-    if match:
-        return match.group(1)
-
-    return None
+def clean_price(text: str) -> str:
+    """Strip currency symbols, spaces → keep digits, comma, dot."""
+    return re.sub(r"[^\d,.]", "", text).strip()
 
 
-def parse_products(data: dict | list) -> list[dict]:
-    """
-    Normalise the JSON payload into a flat list of product dicts.
-    digitalhome.az returns either:
-      • {"data": [...], "total": N, ...}
-      • {"products": {"data": [...], ...}}
-      • raw HTML string under "data" key  (HTML fragment)
-    """
-    products: list[dict] = []
-
-    # ── JSON list directly ──────────────────────────────────────────────────
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        # Try common envelope keys
-        for key in ("data", "products", "items", "result"):
-            val = data.get(key)
-            if isinstance(val, list):
-                items = val
-                break
-            if isinstance(val, dict):
-                inner = val.get("data") or val.get("items") or []
-                if isinstance(inner, list):
-                    items = inner
-                    break
-        else:
-            # Fall back: if "data" is an HTML string, parse it
-            raw = data.get("data", "")
-            if isinstance(raw, str) and "<" in raw:
-                return parse_html_fragment(raw)
-            items = []
-    else:
-        return products
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        products.append(normalise(item))
-
-    return products
+def parse_total(message: str) -> int:
+    """'164 məhsul' → 164"""
+    m = re.search(r"\d+", message or "")
+    return int(m.group()) if m else 0
 
 
-def parse_html_fragment(html: str) -> list[dict]:
-    """Parse product cards from an HTML fragment response."""
+def parse_cards(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     products = []
 
-    for card in soup.select(".product-item, .item, [class*='product']"):
-        name_tag = card.select_one(
-            ".product-name, .name, h3, h2, [class*='title']"
-        )
-        price_tag = card.select_one(
-            ".product-price, .price, [class*='price']"
-        )
-        link_tag = card.select_one("a[href]")
-        img_tag = card.select_one("img")
+    for card in soup.select("div.tpproduct"):
+        # ── name & url ───────────────────────────────────────────────────
+        title_a = card.select_one("h3.tpproduct__title a")
+        name = ""
+        url = ""
+        if title_a:
+            name = title_a.get("title") or title_a.get_text(strip=True)
+            url = title_a.get("href", "")
 
-        name = name_tag.get_text(strip=True) if name_tag else ""
-        price_raw = price_tag.get_text(strip=True) if price_tag else ""
-        price = re.sub(r"[^\d.,]", "", price_raw)
-        url = BASE_URL + link_tag["href"] if link_tag else ""
-        image = img_tag.get("src", "") or img_tag.get("data-src", "") if img_tag else ""
+        # ── image ────────────────────────────────────────────────────────
+        thumb_a = card.select_one("div.tpproduct__thumb > a")
+        image = ""
+        if thumb_a:
+            img = thumb_a.select_one("img:not(.product-thumb-secondary)")
+            if not img:
+                img = thumb_a.find("img")
+            if img:
+                image = img.get("src") or img.get("data-src", "")
+
+        # ── prices ───────────────────────────────────────────────────────
+        price_new_tag = card.select_one("span.price-new")
+        price_old_tag = card.select_one("span.price-old")
+        price_current = clean_price(price_new_tag.get_text()) if price_new_tag else ""
+        price_original = clean_price(price_old_tag.get_text()) if price_old_tag else ""
+
+        # If no sale price, there may only be one price element
+        if not price_current and not price_original:
+            any_price = card.select_one(".product-price-section span")
+            if any_price:
+                price_current = clean_price(any_price.get_text())
+
+        # ── discount badge ───────────────────────────────────────────────
+        badge = card.select_one("span.product__badge-item")
+        discount = badge.get_text(strip=True) if badge else ""
+
+        # ── stock status ─────────────────────────────────────────────────
+        stock_tag = card.select_one("div.stock-status-badge span")
+        in_stock = stock_tag.get_text(strip=True) if stock_tag else ""
+
+        # ── product id ───────────────────────────────────────────────────
+        cart_a = card.select_one("a.add-to-cart")
+        product_id = cart_a.get("data-id", "") if cart_a else ""
+
+        # ── installments ─────────────────────────────────────────────────
+        def get_installment(months: int) -> str:
+            opt = card.select_one(
+                f'div.installment-option[data-month="{months}"]'
+            )
+            return opt.get("data-amount", "").strip() if opt else ""
+
+        install_6m = get_installment(6)
+        install_12m = get_installment(12)
 
         if name:
             products.append(
                 {
+                    "product_id": product_id,
                     "name": name,
-                    "price": price,
+                    "price_current": price_current,
+                    "price_original": price_original,
+                    "discount": discount,
                     "currency": "AZN",
+                    "in_stock": in_stock,
+                    "installment_6m": install_6m,
+                    "installment_12m": install_12m,
                     "url": url,
                     "image": image,
-                    "brand": "",
-                    "sku": "",
-                    "in_stock": "",
                 }
             )
 
     return products
 
 
-def normalise(item: dict) -> dict:
-    """Map various field names to a canonical schema."""
-
-    def get(*keys):
-        for k in keys:
-            v = item.get(k)
-            if v not in (None, "", []):
-                return str(v)
-        return ""
-
-    name = get("name", "title", "product_name")
-    sku = get("sku", "id", "product_id")
-    brand = get("brand", "brand_name", "manufacturer")
-    url_slug = get("url", "slug", "permalink", "link")
-    if url_slug and not url_slug.startswith("http"):
-        url_slug = BASE_URL + "/" + url_slug.lstrip("/")
-    image = get("image", "thumbnail", "image_url", "photo")
-
-    # Price can be nested or flat
-    price = ""
-    for key in ("price", "sale_price", "original_price", "current_price"):
-        raw = item.get(key)
-        if isinstance(raw, (int, float)):
-            price = str(raw)
-            break
-        if isinstance(raw, str) and raw:
-            price = re.sub(r"[^\d.,]", "", raw)
-            break
-        if isinstance(raw, dict):
-            price = str(raw.get("amount") or raw.get("value") or "")
-            break
-
-    in_stock = get("in_stock", "available", "stock_status")
-
-    return {
-        "name": name,
-        "price": price,
-        "currency": "AZN",
-        "url": url_slug,
-        "image": image,
-        "brand": brand,
-        "sku": sku,
-        "in_stock": in_stock,
-    }
-
-
 # ---------------------------------------------------------------------------
-# Async scraping logic
+# Async fetching
 # ---------------------------------------------------------------------------
-
-async def bootstrap_session(session: aiohttp.ClientSession) -> str | None:
-    """
-    Load the listing page once to warm up cookies and grab the CSRF token.
-    Returns the CSRF token string (or None if not found).
-    """
-    url = BASE_URL + LISTING_PATH
-    try:
-        async with session.get(url, headers=HEADERS, ssl=True) as resp:
-            html = await resp.text()
-            csrf = extract_csrf(html)
-            return csrf
-    except Exception as exc:
-        print(f"[bootstrap] ERROR: {exc}", file=sys.stderr)
-        return None
-
 
 async def fetch_page(
     session: aiohttp.ClientSession,
     page: int,
-    csrf: str | None,
     sem: asyncio.Semaphore,
 ) -> tuple[int, list[dict], int]:
-    """
-    Fetch a single listing page.
-    Returns (page_number, products, total_pages).
-    """
+    """Returns (page, products, total_items)."""
     url = BASE_URL + LISTING_PATH
     params = build_params(page)
-    extra_headers = dict(HEADERS)
-    if csrf:
-        extra_headers["X-CSRF-TOKEN"] = csrf
 
     async with sem:
         try:
             async with session.get(
-                url, params=params, headers=extra_headers, ssl=True
+                url, params=params, headers=HEADERS, ssl=True
             ) as resp:
                 resp.raise_for_status()
-                content_type = resp.content_type or ""
-                raw = await resp.text()
+                data = await resp.json(content_type=None)
 
-                if "json" in content_type:
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        data = {}
-                elif raw.lstrip().startswith("{") or raw.lstrip().startswith("["):
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        data = {}
-                else:
-                    # HTML response — wrap for parse_products
-                    data = {"data": raw}
+                html_fragment = data.get("data", "")
+                message = data.get("message", "")
+                total_items = parse_total(message)
 
-                products = parse_products(data)
-
-                # Try to determine total pages from pagination metadata
-                total_pages = 1
-                if isinstance(data, dict):
-                    for meta_key in (
-                        "last_page", "total_pages", "pageCount", "pages"
-                    ):
-                        v = data.get(meta_key)
-                        if isinstance(v, int) and v > 0:
-                            total_pages = v
-                            break
-                    # Calculate from total + per_page
-                    total_items = None
-                    for tot_key in ("total", "count", "total_count"):
-                        v = data.get(tot_key)
-                        if isinstance(v, int):
-                            total_items = v
-                            break
-                    if total_items and total_pages == 1:
-                        import math
-                        total_pages = math.ceil(total_items / PER_PAGE)
-
-                print(
-                    f"  page {page:3d} → {len(products):3d} products"
-                    + (f"  (total_pages={total_pages})" if page == 1 else "")
-                )
-                return page, products, total_pages
+                products = parse_cards(html_fragment)
+                print(f"  page {page:3d} → {len(products):3d} products", flush=True)
+                return page, products, total_items
 
         except aiohttp.ClientResponseError as exc:
             print(f"  page {page:3d} → HTTP {exc.status}", file=sys.stderr)
         except Exception as exc:
             print(f"  page {page:3d} → ERROR: {exc}", file=sys.stderr)
 
-    return page, [], 1
+    return page, [], 0
 
 
 async def scrape_all() -> list[dict]:
@@ -309,27 +225,19 @@ async def scrape_all() -> list[dict]:
     timeout = aiohttp.ClientTimeout(total=60)
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    async with aiohttp.ClientSession(
-        connector=connector, timeout=timeout
-    ) as session:
-        print("Bootstrapping session …")
-        csrf = await bootstrap_session(session)
-        print(f"CSRF token: {csrf[:20]}…" if csrf else "CSRF token: not found")
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # ── Page 1: discover total ────────────────────────────────────────
+        print("Fetching page 1 to determine total …")
+        _, first_products, total_items = await fetch_page(session, 1, sem)
 
-        # Fetch page 1 first to learn total page count
-        print("\nFetching page 1 to determine pagination …")
-        _, first_products, total_pages = await fetch_page(session, 1, csrf, sem)
-
-        if total_pages < 1:
-            total_pages = 1
-
-        print(f"Total pages detected: {total_pages}\n")
+        total_pages = max(1, math.ceil(total_items / PER_PAGE))
+        print(f"Total items: {total_items}  |  Total pages: {total_pages}\n")
 
         all_products: list[dict] = list(first_products)
 
         if total_pages > 1:
             tasks = [
-                fetch_page(session, p, csrf, sem)
+                fetch_page(session, p, sem)
                 for p in range(2, total_pages + 1)
             ]
             results = await asyncio.gather(*tasks)
@@ -343,13 +251,12 @@ async def scrape_all() -> list[dict]:
 # CSV writer
 # ---------------------------------------------------------------------------
 
-FIELDNAMES = ["name", "price", "currency", "url", "image", "brand", "sku", "in_stock"]
-
-
 def save_csv(products: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=FIELDNAMES, extrasaction="ignore")
+        writer = csv.DictWriter(
+            fh, fieldnames=FIELDNAMES, extrasaction="ignore"
+        )
         writer.writeheader()
         writer.writerows(products)
     print(f"\nSaved {len(products)} rows → {path}")
@@ -364,15 +271,15 @@ def main() -> None:
     products = asyncio.run(scrape_all())
 
     if not products:
-        print("No products scraped — check the response structure.", file=sys.stderr)
+        print("No products scraped.", file=sys.stderr)
         sys.exit(1)
 
-    # Deduplicate by URL (keep first occurrence)
+    # Deduplicate by product_id (fallback: url)
     seen: set[str] = set()
     unique: list[dict] = []
     for p in products:
-        key = p.get("url") or p.get("name") or str(p)
-        if key not in seen:
+        key = p.get("product_id") or p.get("url") or p.get("name")
+        if key and key not in seen:
             seen.add(key)
             unique.append(p)
 
