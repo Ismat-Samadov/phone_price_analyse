@@ -202,7 +202,7 @@ async def fetch_page(
                 resp.raise_for_status()
                 data = await resp.json(content_type=None)
 
-                pdata    = data["pageProps"]["products"]
+                pdata    = data["pageProps"]["products"]["products"]
                 items    = pdata.get("items", [])
                 total    = pdata.get("total", 0)
                 products = [parse_product(p) for p in items]
